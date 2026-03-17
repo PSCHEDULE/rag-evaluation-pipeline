@@ -1,8 +1,7 @@
 # Capstone Design and Practice  
 **Dot AI: RAG 기반 한국어 문서 Q&A 시스템**
 
-**개발 기간**: 2025년 1학기  
-**팀명**: Dot AI  
+**개발 기간**: 2026년 1학기  
 
 ---
 
@@ -59,4 +58,4 @@ streamlit run test.py
 
 ---
 
-**Capstone Design and Practice 최종 결과물** 정확한 문서 기반 답변 + 출처 투명성 + 영속성 DB를 통해 실무 적용 가능한 RAG 시스템을 성공적으로 구현하였습니다.
+**Capstone Design and Practice** 본 프로젝트는 응답의 정확도를 넘어 '신뢰할 수 있는 AI'를 위한 평가 체계 구축에 집중합니다.
