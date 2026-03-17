@@ -1,0 +1,101 @@
+# =============================================
+# Python 프로젝트 기본 무시 (Streamlit + LangChain)
+# =============================================
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# =============================================
+# 이 프로젝트 특화 무시 (코드 기반)
+# =============================================
+
+# ChromaDB 로컬 벡터 저장소 (persist_directory="./chroma_db")
+# → 등록 버튼으로 생성되며, git에 올리면 안 됨
+chroma_db/
+
+# 업로드된 문서 임시 파일 (코드에서 tempfile 사용 후 바로 삭제)
+*.tmp
+*.temp
+
+# Streamlit 세션/캐시 (필요 시 자동 생성)
+.streamlit/cache/
+.streamlit/secrets.toml
+
+# 환경 변수 파일 (UPSTAGE_API_KEY 등)
+.env
+.env.local
+.env.*.local
+
+# =============================================
+# OS / IDE / 로그 관련
+# =============================================
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+logs/
+
+# Coverage / 테스트
+.coverage
+htmlcov/
+.pytest_cache/
+.tox/
+.nox/
+
+# =============================================
+# 사용법
+# =============================================
+# 1. 프로젝트 루트에 .gitignore 파일로 저장
+# 2. chroma_db/ 폴더가 이미 있다면:
+#    git rm -r --cached chroma_db/
+#    git commit -m "Remove chroma_db from tracking"
