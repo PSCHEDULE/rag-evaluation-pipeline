@@ -1,284 +1,185 @@
 from __future__ import annotations
 
+import hashlib
 import os
-import shutil
-import tempfile
 from pathlib import Path
-from typing import List, Tuple
 
 import streamlit as st
+from dotenv import load_dotenv
+from openai import APIConnectionError, APIStatusError, AuthenticationError, RateLimitError
 
-# ====================== LangChain imports ======================
-from langchain_chroma import Chroma
-from langchain_community.document_loaders import PyPDFLoader, TextLoader
-from langchain_core.documents import Document
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_upstage import ChatUpstage, UpstageEmbeddings
-
-# ====================== CONFIG ======================
-SYSTEM_PROMPT = """당신은 Dot AI입니다. 업로드된 문서에서 제공된 맥락만을 사용하여 질문에 답변하세요. 규칙:
-- 답변은 제공된 맥락에 엄격히 기반하세요.
-- 질문이 리스트를 묻는 경우 (예: "세 가지 ...는 무엇인가?"), 맥락에 존재하면 완전한 리스트를 반환하세요.
-- 맥락에 답변의 일부만 있는 경우, "문서에 부분 정보만 포함되어 있습니다"라고 말하고 찾은 내용을 보여주세요.
-- 맥락에 답변이 없는 경우, "업로드된 문서에 해당 내용이 없습니다"라고 말하세요.
-- 가능하면 맥락에서 짧은 구절을 인용하세요."""
-
-CHROMA_DB_PATH = "./chroma_db"
-EMBEDDING_MODEL = "solar-embedding-1-large"
-LLM_MODEL = "solar-1-mini-chat"
-BATCH_SIZE = 50
-MAX_SNIPPET_CHARS = 900
+from rag import (
+    CHROMA_DB_PATH,
+    LLM_MODEL,
+    create_embeddings,
+    create_llm,
+    format_sources,
+    has_documents,
+    index_documents,
+    open_vectorstore,
+    reset_vectorstore,
+    stream_answer,
+)
 
 
-# ====================== HELPERS ======================
-def files_to_documents(uploaded_files) -> List[Document]:
-    """Streamlit UploadedFile → LangChain Document (TemporaryDirectory로 자동 정리)."""
-    documents: List[Document] = []
-
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        for uploaded_file in uploaded_files:
-            file_path = Path(tmp_dir) / uploaded_file.name
-            file_path.write_bytes(uploaded_file.getvalue())
-
-            loader = (
-                PyPDFLoader(str(file_path))
-                if uploaded_file.name.lower().endswith(".pdf")
-                else TextLoader(str(file_path))
-            )
-            documents.extend(loader.load())
-
-    return documents
+def sync_api_key(api_key: str) -> None:
+    """Drop session-local clients when credentials change, without changing process env."""
+    fingerprint = hashlib.sha256(api_key.encode()).hexdigest() if api_key else None
+    if st.session_state.get("client_key") != fingerprint:
+        for name in ("vectorstore", "llm", "llm_temperature"):
+            st.session_state.pop(name, None)
+        st.session_state["client_key"] = fingerprint
 
 
-def chunk_documents(docs: List[Document]) -> List[Document]:
-    """문서를 1000자 청크로 분할."""
-    splitter = RecursiveCharacterTextSplitter(
-        separators=["\n\n", "\n", ".", "?", "!", " "],
-        chunk_size=1000,
-        chunk_overlap=100,
-    )
-    return splitter.split_documents(docs)
-
-
-def format_sources(docs: List[Document]) -> List[Tuple[str, str]]:
-    """출처 중복 제거 + 스니펫 정리."""
-    sources: List[Tuple[str, str]] = []
-    seen = set()
-
-    for doc in docs:
-        source = doc.metadata.get("source", "알 수 없음")
-        page = doc.metadata.get("page")
-        title = f"{source} (p. {page + 1})" if page is not None else source
-
-        if title in seen:
-            continue
-        seen.add(title)
-
-        snippet = (doc.page_content or "").strip().replace("\n", " ")
-        if len(snippet) > MAX_SNIPPET_CHARS:
-            snippet = snippet[:MAX_SNIPPET_CHARS] + "..."
-
-        sources.append((title, snippet))
-
-    return sources
-
-
-def setup_api_key(api_key: str) -> None:
-    """API 키 검증 + 환경변수 설정."""
+def get_vectorstore(api_key: str):
     if not api_key:
-        st.error("API 키가 필요합니다.")
-        st.stop()
-    os.environ["UPSTAGE_API_KEY"] = api_key
-
-    if st.session_state.get("validated_api_key") == api_key:
-        return
-
-    try:
-        UpstageEmbeddings(model=EMBEDDING_MODEL).embed_query("test")
-        st.session_state["validated_api_key"] = api_key
-    except Exception as e:
-        st.session_state.pop("validated_api_key", None)
-        if "401" in str(e) or "invalid_api_key" in str(e):
-            st.error("API 키가 유효하지 않습니다. https://console.upstage.ai 에서 확인해주세요.")
-            st.stop()
-        st.error(f"API 연결 실패: {e}")
-        raise
+        raise ValueError("OpenAI API 키를 입력해주세요.")
+    if st.session_state.get("vectorstore") is None:
+        st.session_state["vectorstore"] = open_vectorstore(create_embeddings(api_key))
+    return st.session_state["vectorstore"]
 
 
-def initialize_vectorstore() -> Chroma | None:
-    """기존 Chroma DB 자동 로드 (없으면 None)."""
-    if not Path(CHROMA_DB_PATH).exists():
-        return None
+def get_llm(api_key: str, temperature: float):
+    if st.session_state.get("llm") is None or st.session_state.get("llm_temperature") != temperature:
+        st.session_state["llm"] = create_llm(api_key, temperature)
+        st.session_state["llm_temperature"] = temperature
+    return st.session_state["llm"]
 
-    api_key = st.session_state.get("api_key")
-    if not api_key:
-        st.warning("API 키를 입력해주세요 (기존 DB 로드).")
-        return None
 
-    setup_api_key(api_key)
+def show_error(error: Exception) -> None:
+    # Provider error bodies can contain credentials or document text; do not echo them.
+    if isinstance(error, AuthenticationError):
+        st.error("OpenAI API 키가 유효하지 않습니다. 키를 확인한 뒤 다시 시도해주세요.")
+    elif isinstance(error, RateLimitError):
+        st.error("OpenAI 요청 한도 또는 API 사용 잔액을 확인해주세요. 잠시 후 다시 시도할 수 있습니다.")
+    elif isinstance(error, APIConnectionError):
+        st.error("OpenAI에 연결하지 못했습니다. 네트워크를 확인한 뒤 다시 시도해주세요.")
+    elif isinstance(error, APIStatusError):
+        st.error("OpenAI 요청에 실패했습니다. 모델 접근 권한과 API 상태를 확인해주세요.")
+    elif isinstance(error, (UnicodeError, ValueError)):
+        st.error("문서를 처리하지 못했습니다. PDF 상태와 TXT/MD 파일의 UTF-8 인코딩을 확인해주세요.")
+    else:
+        st.error("처리 중 오류가 발생했습니다. 파일과 로컬 DB 상태를 확인한 뒤 다시 시도해주세요.")
 
-    with st.spinner("기존 DB 로드 중..."):
-        embeddings = UpstageEmbeddings(model=EMBEDDING_MODEL)
-        vectorstore = Chroma(
-            persist_directory=CHROMA_DB_PATH,
-            embedding_function=embeddings,
+
+def render_sources(sources) -> None:
+    if sources:
+        with st.expander("출처", expanded=False):
+            for title, snippet in sources:
+                st.write(title)
+                st.write(snippet)
+
+
+def main() -> None:
+    load_dotenv(Path(__file__).with_name(".env"))
+    st.set_page_config(page_title="Dot AI · 한국어 문서 Q&A", page_icon="📚")
+    st.title("한국어 문서 Q&A")
+    st.caption(f"Dot AI · {LLM_MODEL} · 문서를 업로드한 뒤 자연어로 질문하세요.")
+    st.session_state.setdefault("messages", [])
+
+    with st.sidebar:
+        st.header("설정")
+        api_key = st.text_input(
+            "OpenAI API 키",
+            value=os.getenv("OPENAI_API_KEY", ""),
+            type="password",
+            key="api_key",
+            help="https://platform.openai.com/api-keys 에서 발급하거나 .env에 OPENAI_API_KEY를 설정하세요.",
+        ).strip()
+        sync_api_key(api_key)
+        temperature = st.slider("창의성", 0.0, 1.0, 0.2, 0.1)
+        top_k = st.slider("검색 수", 2, 12, 8, 1)
+        st.divider()
+        uploaded_files = st.file_uploader(
+            "문서 업로드", type=["txt", "md", "pdf"], accept_multiple_files=True
         )
-        st.info("기존 DB 로드 완료")
-        return vectorstore
+        col1, col2 = st.columns(2)
+        build_index = col1.button("문서 등록", use_container_width=True, disabled=not uploaded_files)
+        clear_chat = col2.button("대화 초기화", use_container_width=True)
+        clear_db = st.button("OpenAI DB 초기화", use_container_width=True)
+        st.caption("등록한 문서는 이 앱의 로컬 DB에 보관됩니다. 질문은 매번 독립적으로 검색합니다.")
 
+    if clear_chat:
+        st.session_state["messages"] = []
 
-# ====================== UI ======================
-st.set_page_config(page_title="한국어 문서 Q&A", page_icon="📚")
+    if clear_db:
+        try:
+            vectorstore = st.session_state.get("vectorstore")
+            if vectorstore is None and Path(CHROMA_DB_PATH).exists():
+                # Reset is local and does not require an OpenAI key.
+                vectorstore = open_vectorstore(None)
+            if vectorstore is not None:
+                reset_vectorstore(vectorstore)
+            st.session_state.pop("vectorstore", None)
+            st.session_state["messages"] = []
+            st.success("OpenAI DB와 대화가 초기화되었습니다.")
+        except Exception as error:
+            show_error(error)
 
-st.title("한국어 문서 Q&A")
-st.caption("문서를 업로드한 뒤 자연어로 질문하세요.")
+    # Retry loading after a key is entered or changed, including after an initial empty key.
+    if api_key and Path(CHROMA_DB_PATH).exists() and st.session_state.get("vectorstore") is None:
+        try:
+            get_vectorstore(api_key)
+        except Exception as error:
+            show_error(error)
 
-# Sidebar
-with st.sidebar:
-    st.header("설정")
+    if Path("chroma_db").exists():
+        st.info("기존 Solar DB는 OpenAI 임베딩과 호환되지 않습니다. 원본 문서를 다시 등록해주세요.")
 
-    api_key = st.text_input(
-        "Upstage API 키",
-        value=os.getenv("UPSTAGE_API_KEY", ""),
-        type="password",
-        help="https://console.upstage.ai 에서 발급",
-    )
-    st.session_state["api_key"] = api_key
-
-    temperature = st.slider("창의성", 0.0, 1.0, 0.2, 0.1)
-    top_k = st.slider("검색 수", 2, 12, 8, 1)
-
-    st.divider()
-
-    uploaded_files = st.file_uploader(
-        "문서 업로드",
-        type=["txt", "md", "pdf"],
-        accept_multiple_files=True,
-    )
-
-    col1, col2 = st.columns(2)
-    build_index = col1.button("문서 등록", use_container_width=True, disabled=not uploaded_files)
-    clear_chat = col2.button("대화 초기화", use_container_width=True)
-
-    if st.button("DB 전체 초기화", use_container_width=True):
-        vs = st.session_state.pop("vectorstore", None)
-        if vs is not None:
+    if build_index:
+        if not api_key:
+            st.warning("OpenAI API 키를 입력해주세요.")
+        else:
+            progress = st.progress(0.0)
             try:
-                vs._client.clear_system_cache()  # SQLite 연결 해제
-            except Exception:
-                pass
-            del vs
+                with st.spinner("문서 분석 및 등록 중..."):
+                    stats = index_documents(get_vectorstore(api_key), uploaded_files, progress.progress)
+                st.success(f"문서 {stats.indexed_files}개 등록 · 새 청크 {stats.chunks:,}개 저장")
+                if stats.skipped_files:
+                    st.info(f"이미 등록된 문서 {stats.skipped_files}개는 건너뛰었습니다.")
+                if stats.empty_files:
+                    st.warning(f"텍스트가 없는 파일 {stats.empty_files}개는 건너뛰었습니다. 스캔 PDF에는 OCR이 필요합니다.")
+            except Exception as error:
+                show_error(error)
+            finally:
+                progress.empty()
 
-        if Path(CHROMA_DB_PATH).exists():
-            shutil.rmtree(CHROMA_DB_PATH)
+    for message in st.session_state["messages"]:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+            render_sources(message.get("sources"))
 
-        st.success("DB가 초기화되었습니다.")
-        st.rerun()
-
-if clear_chat:
-    st.session_state.pop("messages", None)
-    st.rerun()
-
-# Auto-load existing DB
-if "vectorstore" not in st.session_state:
-    st.session_state["vectorstore"] = initialize_vectorstore()
-
-# Chat history
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
-        if message.get("sources"):
-            with st.expander("출처", expanded=False):
-                for title, snippet in message["sources"]:
-                    st.markdown(f"**{title}**")
-                    st.write(snippet)
-
-# Index building
-if build_index and uploaded_files:
-    setup_api_key(api_key)
-
-    with st.spinner("문서 분석 중..."):
-        documents = files_to_documents(uploaded_files)
-
-    with st.spinner("텍스트 청킹 중..."):
-        chunks = chunk_documents(documents)
-
-    with st.spinner("벡터 DB 준비 중..."):
-        embeddings = UpstageEmbeddings(model=EMBEDDING_MODEL)
-        vectorstore = Chroma(
-            persist_directory=CHROMA_DB_PATH,
-            embedding_function=embeddings,
-        )
-
-    st.info(f"{len(chunks):,}개 청크 저장 중...")
-    progress_bar = st.progress(0)
-
-    for i in range(0, len(chunks), BATCH_SIZE):
-        vectorstore.add_documents(chunks[i : i + BATCH_SIZE])
-        progress_bar.progress(min((i + BATCH_SIZE) / len(chunks), 1.0))
-
-    st.session_state["vectorstore"] = vectorstore
-    st.success(f"완료! 문서 {len(documents)}개 → 청크 {len(chunks)}개")
-
-# Chat
-if user_query := st.chat_input("질문을 입력하세요..."):
-    if "vectorstore" not in st.session_state or st.session_state["vectorstore"] is None:
-        st.warning("먼저 문서를 등록해주세요.")
-        st.stop()
-
-    setup_api_key(api_key)
-
-    # 사용자 메시지
-    st.session_state.messages.append({"role": "user", "content": user_query})
-    with st.chat_message("user"):
-        st.markdown(user_query)
-
-    # RAG + LLM
-    vectorstore: Chroma = st.session_state["vectorstore"]
-    retriever = vectorstore.as_retriever(search_kwargs={"k": top_k})
-
-    with st.chat_message("assistant"):
-        with st.spinner("생각 중..."):
-            docs = retriever.invoke(user_query)
-            context = "\n\n---\n\n".join(doc.page_content for doc in docs)
-
-            prompt = ChatPromptTemplate.from_messages([
-                ("system", SYSTEM_PROMPT),
-                ("human", "Context:\n{context}\n\nQuestion:\n{question}"),
+    if user_query := st.chat_input("질문을 입력하세요..."):
+        if not api_key:
+            st.warning("OpenAI API 키를 입력해주세요.")
+            return
+        user_query = user_query.strip()
+        if not user_query:
+            return
+        try:
+            vectorstore = get_vectorstore(api_key)
+            if not has_documents(vectorstore):
+                st.warning("먼저 문서를 등록해주세요.")
+                return
+            with st.chat_message("user"):
+                st.markdown(user_query)
+            with st.chat_message("assistant"):
+                with st.spinner("문서 검색 중..."):
+                    docs = vectorstore.similarity_search(user_query, k=top_k)
+                if not docs:
+                    st.warning("검색된 문서가 없습니다. 문서를 다시 등록해주세요.")
+                    return
+                answer = st.write_stream(stream_answer(get_llm(api_key, temperature), user_query, docs))
+                sources = format_sources(docs)
+                render_sources(sources)
+            # Save only complete turns, so failed/partial requests can be retried cleanly.
+            st.session_state["messages"].extend([
+                {"role": "user", "content": user_query},
+                {"role": "assistant", "content": answer, "sources": sources},
             ])
+        except Exception as error:
+            show_error(error)
 
-            llm = ChatUpstage(
-                model=LLM_MODEL,
-                temperature=temperature,
-                streaming=True,
-            )
 
-            messages = prompt.format_messages(context=context, question=user_query)
-
-            answer_placeholder = st.empty()
-            full_answer = ""
-
-            for chunk in llm.stream(messages):
-                full_answer += chunk.content
-                answer_placeholder.markdown(full_answer + "▌")
-
-            answer_placeholder.markdown(full_answer)
-
-            # 출처
-            sources = format_sources(docs)
-            if sources:
-                with st.expander("출처", expanded=False):
-                    for title, snippet in sources:
-                        st.markdown(f"**{title}**")
-                        st.write(snippet)
-
-    # 대화 기록 저장
-    st.session_state.messages.append({
-        "role": "assistant",
-        "content": full_answer,
-        "sources": sources,
-    })
+if __name__ == "__main__":
+    main()
